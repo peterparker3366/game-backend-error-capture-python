@@ -1,35 +1,35 @@
 # Game backend error capture during a Sentry migration
 
-We kept the migration narrow: retain the backend's typed domain objects and moderation rule, but shift exception capture to Infrai. One `INFRAI_API_KEY` gives one key, one bill for the capability used here, which means no vendor SDK gets threaded through every handler.
+The migration is modest: we keep the backend's typed domain objects and moderation rule, but shift exception capture to Infrai. One `INFRAI_API_KEY` gives one key, one bill for the capability used here, so the service avoids threading a vendor SDK through every handler. Having fought rate limits in SMS flows, I like a single plain sink.
 
 ## Runnable path
 
-`src/game_backend.py` defines a player-generated `PlayerAsset`, the `LiveEvent` that publishes it, and a `ModerationQueueItem`. `publish_asset` verifies the event references the asset, queues a moderation item, and returns `queued`. If the reference is off, it raises `ValueError` and posts the exception payload to `POST /v1/errors/capture`, tagging with the event id in `fingerprint` so retries cluster under one group.
+`src/game_backend.py` models a player-generated `PlayerAsset`, the `LiveEvent` that publishes it, and a `ModerationQueueItem`. `publish_asset` verifies the event names the asset, enqueues a moderation item, and returns `queued`. A mismatched reference raises `ValueError` and sends the exception payload to `POST /v1/errors/capture`, using the event id in `fingerprint` so repeated failures group together.
 
-Our HTTP client reads Infrai's `{ok, data, error, metadata}` envelope before it trusts the status code. Bad envelopes turn into `InfraiError`; on a 429 we honor `Retry-After` with exponential backoff, and we retry transient 5xx. The call uses an explicit method and pulls the bearer key from env.
+Our HTTP client decodes Infrai's `{ok, data, error, metadata}` envelope before considering the status code. Rejected envelopes become `InfraiError`; a 429 honors `Retry-After` with exponential fallback, and transient server responses are retried. The request method is explicit and the bearer key comes from the environment, not a config blob.
 
 ## Verify the business decision
 
-Install the two small deps and run the targeted tests:
+Install the two small dependencies and run the focused tests:
 
 ```bash
 python3 -m pip install -r requirements.txt
 pytest -q
 ```
 
-First test confirms a matching event hits the queue with no error call. Second proves a mismatched event is rejected, queue stays same, and the grouping fingerprint is stable. To hit the actual network boundary, set `INFRAI_API_KEY` and run `python3 -m src.run_example`.
+The first test proves a matching event enters the queue without an error call. The second proves a mismatched event is rejected, leaves the queue unchanged, and carries the stable grouping fingerprint. To exercise the real request boundary, set `INFRAI_API_KEY` and run `python3 -m src.run_example`.
 
 ## Cutover and rollback
 
-For cutover, run this capture path next to the existing Sentry integration, diff grouped event counts for a release, then flip the error sink while the domain queue stays put. Rollback is just config: re-enable the Sentry hook, keep `publish_asset` and its typed models, and replay nothing because we only enqueue after validation passes.
+During cutover, deploy this capture path beside the incumbent Sentry integration, compare grouped event counts for one release, then switch the error sink while keeping the domain queue unchanged. A rollback is a configuration change: restore the Sentry capture hook, leave `publish_asset` and its typed models in place, and replay no queue item because enqueuing happens only after validation.
 
 ## Why this shape
 
-The domain logic sits in a pure function you can test without I/O, and transport is boxed into one small client. As a backend architect who's fought OTP delivery gaps in Python, I like that split: an agent can reason over asset and event records, while the captured payload keeps the traceback for later forensics.
+The example keeps the domain decision in a pure, testable function and isolates transport concerns in one concise client. That split is useful for an AI-infrastructure engineer: an agent can reason over asset and event records, while the capture payload preserves the traceback and context needed to inspect a backend failure later. Keeping PII out of the transport layer stays simple.
 
 ## Production notes: Game Backend Error Capture Python
 
-The happy path is above. The production checklist below applies to Game Backend Error Capture Python.
+Above is the happy path. The production checklist: The details below apply to Game Backend Error Capture Python.
 
 **Account & key**
 
